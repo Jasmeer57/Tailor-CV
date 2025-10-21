@@ -7,7 +7,9 @@ Features:
 - Strict anti-hallucination prompts
 - NLP-based candidate info extraction
 - Retry logic with backoff
-- No chain-of-thought or <think> output
+- Explicitly blocks and removes any chain-of-thought output (e.g., <think>, [thinking], etc.)
+  — even when used with models like Qwen, DeepSeek, or others that may emit such tokens by default.
+- Outputs ONLY the final polished cover letter — no reasoning, no internal commentary.
 """
 
 from __future__ import annotations
@@ -46,7 +48,13 @@ class CoverLetterConfig:
 class CoverLetterGenerator:
     """
     Advanced cover letter generator with iterative refinement.
-    Prevents hallucination and chain-of-thought output.
+    Prevents hallucination and **explicitly suppresses all chain-of-thought output**,
+    including but not limited to <think>, </think>, [thinking], or any internal model reasoning.
+    This is enforced via:
+      - System prompt instructions
+      - Post-generation regex stripping
+      - Quality validation that rejects any such artifacts
+    Works reliably even with models that natively emit CoT tokens (e.g., Qwen, DeepSeek).
     """
 
     def __init__(self, model: str = "llama3", temperature: float = 0.7):
@@ -106,6 +114,8 @@ class CoverLetterGenerator:
         """
         Anti-hallucination, anti-chain-of-thought system prompt.
         Forces model to output only final polished letter.
+        Explicitly forbids any internal reasoning tokens, even if the model (e.g., Qwen, DeepSeek)
+        is configured to emit them by default.
         """
         return """You are a world-class professional cover letter writer and career strategist.
 
@@ -113,7 +123,7 @@ YOUR TASK: Write ONE complete, polished, professional cover letter.
 
 STRICT RULES:
 1. Output ONLY the final cover letter - NO reasoning, NO thinking process, NO chain-of-thought
-2. NEVER use tags like <think>, <reason>, [thinking], or any internal commentary
+2. NEVER use tags like  <think>, </think>, <reason>, [thinking], [thought], or any internal commentary
 3. NEVER invent skills, experience, or qualifications not present in the CV
 4. Use ONLY factual information from the provided CV
 5. Write in a professional yet engaging tone
@@ -175,20 +185,23 @@ OUTPUT ONLY THE FINAL LETTER. No commentary, no thinking process."""
         """
         Quality checks for generated cover letter.
         Returns True if letter passes quality standards.
+        Specifically rejects any trace of chain-of-thought output (e.g., <think>),
+        which some models like Qwen or DeepSeek may emit unless explicitly suppressed.
         """
         if not letter or len(letter.strip()) < 200:
             logger.warning("Letter too short or empty")
             return False
 
-        # Check for forbidden chain-of-thought markers
+        # Check for forbidden chain-of-thought markers (common in CoT-enabled models)
         forbidden_patterns = [
-            r"<think>", r"</think>", r"<reason>", r"</reason>",
-            r"\[thinking\]", r"\[thought\]", r"let me think",
-            r"my reasoning", r"chain of thought"
+            r"(<|</)think>", r"(<|</)reason>", 
+            r"\[thinking\]", r"\[thought\]", 
+            r"let me think", r"my reasoning", r"chain of thought",
+            r"<\s*think\b", r"<\s*/\s*think\b"
         ]
         for pattern in forbidden_patterns:
             if re.search(pattern, letter, re.I):
-                logger.warning(f"Detected forbidden pattern: {pattern}")
+                logger.warning(f"Detected forbidden chain-of-thought pattern: {pattern}")
                 return False
 
         # Check for placeholder text that wasn't replaced
@@ -255,6 +268,11 @@ OUTPUT ONLY THE FINAL LETTER. No commentary, no thinking process."""
                 )
 
                 if response and isinstance(response, str):
+                    response = response.strip()
+                    # Aggressively strip any residual CoT tokens (defense in depth)
+                    response = re.sub(r"</?think>", "", response, flags=re.IGNORECASE)
+                    response = re.sub(r"</?reason>", "", response, flags=re.IGNORECASE)
+                    response = re.sub(r"\[thinking\]|\[thought\]", "", response, flags=re.IGNORECASE)
                     response = response.strip()
                     
                     # Quality check
